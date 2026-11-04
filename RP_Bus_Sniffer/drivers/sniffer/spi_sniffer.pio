@@ -1,0 +1,42 @@
+;
+; 40MHz SPI 从机监听：200MHz 过采样
+;
+; 程序只有一条 `in pins,4`：每个 200MHz 周期把 CS/SCK/MOSI/MISO 四个脚的
+; 原始电平锁进 ISR，8 个采样点（40ns）自动 push 一个字。状态机永远不停，
+; 由 DMA 环形缓冲连续取走，帧的起止完全由软件在采样流里找 CS 的边沿。
+;
+; 为什么不用 wait 追边沿：
+;   用 `wait 1 gpio / wait 0 gpio` 时，状态机必须在两拍之内同时"看见"
+;   上升沿和随后的下降沿；只要某一拍没采到（占空比畸变、边沿变缓、抖动），
+;   这一位就整个丢掉，而且会连带后面的位错位。过采样没有这个前提：一个 bit
+;   有 5 个采样点，只要其中任意一拍采到高电平就能解出这一位，边沿位置还
+;   能精确到 5ns，顺便量出 SCK 高电平宽度，直接反映信号质量。
+;
+; 引脚约定（四条线必须连续排列，IN_BASE 由 C 侧 sm_config_set_in_pins 设置）：
+;   IN_BASE+0 = CS   IN_BASE+1 = SCK   IN_BASE+2 = MOSI   IN_BASE+3 = MISO
+;
+; 字格式（autopush 32bit，右移）：
+;   bit[4k+0] = CS   bit[4k+1] = SCK   bit[4k+2] = MOSI  bit[4k+3] = MISO
+;   k = 0 是该字最早的采样点，k = 7 是最晚的。
+
+.program spi_oversample
+.wrap_target
+    in pins, 4
+.wrap
+
+;
+; 诊断用：实测系统时钟。
+;
+; 在 clkdiv=1 下执行 N 次 1 周期循环，Core 1 用 XOSC 时基（time_us_64，
+; 与 clk_sys 无关）计时，反算出 clk_sys。它和 PLL 寄存器自报的频率无关，
+; 是真正的频率测量：200MHz 和 150MHz 的耗时相差 33%，一眼就能看出来。
+;
+.program clk_cal
+.wrap_target
+    pull block              ; 从 TX FIFO 取计数值
+    mov x, osr
+loop:
+    jmp x-- loop            ; 1 周期/次
+    mov isr, null
+    push block              ; 通知 Core 1 跑完了
+.wrap
