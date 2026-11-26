@@ -31,11 +31,17 @@
 #include "sniffer.h"
 #include "st7789.h"
 
+#if SNIFF_CAPTURE_TO_SD && (CAP_MODE == CAP_MODE_STREAM)
+#include "sdcard.h"
+#include "ff.h"
+#endif
+
 /* 屏幕一行最多容纳 22 个字符（135 像素宽 / 6 像素字宽），超出的部分截掉 */
 #define UI_CHARS 22
 /* 字体缩放倍数：1 = 6x8 点阵原尺寸 */
 #define UI_SCALE 1
 
+#if !SNIFF_CAPTURE_TO_SD
 /* 把内部状态枚举翻译成屏幕/串口上显示的英文单词 */
 static const char *state_name(uint32_t state)
 {
@@ -49,6 +55,24 @@ static const char *state_name(uint32_t state)
     default:              return "?";
     }
 }
+#endif
+
+#if SNIFF_CAPTURE_TO_SD
+/* 落盘状态的中文/英文短名（屏幕一行最多 22 个字符） */
+static const char *cap_name(uint32_t state)
+{
+    switch (state) {
+    case CAP_OFF:     return "OFF";
+    case CAP_SD_INIT: return "SD INIT";
+    case CAP_ARMED:   return "ARMED";
+    case CAP_WINDOW:  return "WINDOW";
+    case CAP_WRITING: return "WRITE";
+    case CAP_DONE:    return "DONE";
+    case CAP_ERROR:   return "ERROR";
+    default:          return "?";
+    }
+}
+#endif
 
 /*
  * 在屏幕的固定行上打印一行文本。
@@ -87,6 +111,7 @@ static void draw_line(int y, uint16_t fg, const char *fmt, ...)
     st7789_draw_text(2, y, line, fg, LCD_BLACK, UI_SCALE);
 }
 
+#if !SNIFF_CAPTURE_TO_SD
 /*
  * 把前 count 个字节格式化成 "AA BB CC ..." 字符串，供屏幕显示。
  *
@@ -309,6 +334,290 @@ static void render(void)
                   (unsigned long)g_sniff.ring_tail);
     }
 }
+#else /* SNIFF_CAPTURE_TO_SD */
+
+#if CAP_MODE == CAP_MODE_STREAM
+/*
+ * 连续记录模式下的写卡循环（Core 0，不返回）。
+ *
+ * 分工：Core 1 只做"从环形缓冲里取帧、拼进 64KB 乒乓缓冲"，
+ * 本核负责这些缓冲真正落到 TF 卡上——FatFs 只在 Core 0 上跑，
+ * 不会出现两个核同时操作文件系统。
+ *
+ * 一个缓冲约 1.8 秒的总线流量（64KB / 35KB/s），写卡只要几十毫秒，
+ * 所以正常情况下 Core 1 永远等得到空闲缓冲；万一卡变慢，Core 1 会
+ * 丢帧并计入 cap_lost，而不是把采样拖死。
+ *
+ * 屏幕在整段采集期间是"离线"的：LCD 和 TF 卡共用 GPIO10/11，
+ * 写卡期间这对脚归 SD。所以这里只通过串口报告进度，等全部写完、
+ * 把总线交回来之后，再把结果一次性画到屏幕上。
+ */
+static void wr_u32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static void stream_writer(void)
+{
+    static FATFS s_fs;
+    static FIL   s_fil;
+
+    sdcard_info_t info;
+    bool mounted = false;
+    bool opened  = false;
+    bool dead    = false;      /* 卡写失败后不再重试，但仍把缓冲标记放行 */
+    uint32_t err    = 0;
+    uint32_t bytes  = 0;
+    uint32_t frames = 0;
+
+    g_sniff.cap_state = CAP_SD_INIT;
+    __dmb();
+
+    if (!sdcard_init(&info)) {
+        err = info.err_stage ? info.err_stage : 1u;
+        goto finish;
+    }
+    if (f_mount(&s_fs, "", 1) != FR_OK) {
+        err = 10u;
+        goto finish;
+    }
+    mounted = true;
+
+    if (f_open(&s_fil, "RPSTREAM.BIN", FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) {
+        err = 11u;
+        goto finish;
+    }
+    opened = true;
+
+    /* 文件头。采集率在 Core 1 上实测得到；若还没测完，退回到时钟树配置值，
+     * PC 端只把它当"每微秒多少采样点"，差一点不影响波形解码。 */
+    {
+        uint32_t khz = g_sniff.clk_meas_khz;
+        uint32_t hz  = khz ? khz * 1000u : clock_get_hz(clk_sys);
+        uint8_t h[CAP_STREAM_HDR];
+        memset(h, 0, sizeof(h));
+        wr_u32(h + 0, CAP_STREAM_MAGIC);
+        h[4] = 1;                              /* version */
+        h[5] = 0;
+        h[6] = (uint8_t)CAP_STREAM_HDR;        /* hdr_bytes */
+        h[7] = 0;
+        wr_u32(h + 8, hz);
+        wr_u32(h + 12, hz / 1000u);   /* 测不到也用配置值，别写 0 */
+
+        UINT bw = 0;
+        if (f_write(&s_fil, h, sizeof(h), &bw) != FR_OK || bw != sizeof(h)) {
+            err = 12u;
+            dead = true;
+        }
+        bytes = CAP_STREAM_HDR;
+        g_sniff.cap_sample_hz = hz;
+        g_sniff.cap_file_bytes = bytes;
+        __dmb();
+
+        printf("stream start: rate=%luHz khz=%lu buf=%luB x%lu ms=%lu\n",
+               (unsigned long)hz, (unsigned long)khz,
+               (unsigned long)CAP_STREAM_BUF_BYTES,
+               (unsigned long)CAP_STREAM_SLOTS,
+               (unsigned long)CAP_STREAM_MS);
+    }
+
+    /* 兜底：Core 1 正常应该在 CAP_STREAM_MS 之后收尾。若它自检失败或
+     * 根本没跑起来，这里不能无限等下去，否则屏幕上永远没有结果。 */
+    uint64_t t_deadline = time_us_64() +
+                          (uint64_t)(CAP_STREAM_MS + 30000u) * 1000ull;
+
+    for (;;) {
+        bool wrote = false;
+
+        for (uint32_t i = 0; i < CAP_STREAM_SLOTS; i++) {
+            if (g_cap_slot[i].state != CAP_SLOT_READY) {
+                continue;
+            }
+            __dmb();
+            uint32_t n  = g_cap_slot[i].bytes;
+            uint32_t nf = g_cap_slot[i].frames;
+            if (n > CAP_STREAM_BUF_BYTES) {
+                n = CAP_STREAM_BUF_BYTES;
+            }
+
+            if (!dead) {
+                UINT bw = 0;
+                if (f_write(&s_fil, g_cap_buf[i], n, &bw) != FR_OK || bw != n) {
+                    if (err == 0u) {
+                        err = 12u;
+                    }
+                    dead = true;          /* 卡坏了就别再试，放行缓冲让 Core 1 跑完 */
+                } else {
+                    bytes += bw;
+                    (void)f_sync(&s_fil); /* 掉电时最多丢最后一块 */
+                }
+            }
+
+            frames += nf;
+            g_sniff.cap_file_bytes = bytes;
+            g_sniff.cap_frames = frames;
+            __dmb();
+            g_cap_slot[i].state = CAP_SLOT_FREE;   /* 交还给 Core 1 */
+            wrote = true;
+
+            printf("stream buf%lu %luB frames=%lu total=%luB lost=%lu\n",
+                   (unsigned long)i, (unsigned long)n, (unsigned long)nf,
+                   (unsigned long)bytes, (unsigned long)g_sniff.cap_lost);
+        }
+
+        if (g_sniff.cap_stream_done && !wrote) {
+            break;                     /* Core 1 收尾了，缓冲也全写完了 */
+        }
+        if (!wrote) {
+            /* Core 1 用 try_push 通知，FIFO 满时通知会丢；这里最多睡 2ms
+             * 就回来重扫一遍所有缓冲块，不会漏掉 READY 的块。 */
+            uint32_t msg;
+            (void)multicore_fifo_pop_timeout_us(2000u, &msg);
+            if (!g_sniff.cap_stream_done && time_us_64() > t_deadline) {
+                if (err == 0u) {
+                    err = 21u;         /* Core 1 一直没交出任何东西 */
+                }
+                break;
+            }
+        }
+    }
+
+finish:
+    if (opened) {
+        if (!dead) {
+            bytes = (uint32_t)f_size(&s_fil);
+        }
+        (void)f_close(&s_fil);
+    }
+    if (mounted) {
+        (void)f_mount(NULL, "", 0);
+    }
+    sdcard_deinit();                   /* 把 GPIO10/11 交还，才能重新用 LCD */
+
+    g_sniff.cap_file_bytes = bytes;
+    g_sniff.cap_frames = frames;
+    if (err && g_sniff.cap_err == 0u) {
+        g_sniff.cap_err = err;
+    }
+    __dmb();
+    g_sniff.cap_state = err ? CAP_ERROR : CAP_DONE;
+    __dmb();
+
+    printf("stream finished: file=/RPSTREAM.BIN bytes=%lu frames=%lu "
+           "err=%lu lost=%lu stale=%lu slotdrop=%lu glitch=%lu qdrop=%lu "
+           "maxw=%lu back=%lu\n",
+           (unsigned long)bytes, (unsigned long)frames, (unsigned long)err,
+           (unsigned long)g_sniff.cap_lost, (unsigned long)g_sniff.cap_stale,
+           (unsigned long)g_sniff.cap_slotdrop,
+           (unsigned long)g_sniff.cap_glitch,
+           (unsigned long)g_sniff.cap_qdrop,
+           (unsigned long)g_sniff.cap_frame_maxw,
+           (unsigned long)g_sniff.cap_backw);
+
+    printf("fall locate: near=%lu wide=%lu boot=%lu miss=%lu "
+           "prederr=%lu agemax=%lu\n",
+           (unsigned long)g_sniff.cap_fall_near,
+           (unsigned long)g_sniff.cap_fall_wide,
+           (unsigned long)g_sniff.cap_fall_boot,
+           (unsigned long)g_sniff.cap_fall_miss,
+           (unsigned long)g_sniff.cap_pred_err,
+           (unsigned long)g_sniff.cap_age_max);
+
+    printf("last miss: t=%lu startw=%lu expect=%lu\n",
+           (unsigned long)g_sniff.cap_miss_t,
+           (unsigned long)g_sniff.cap_miss_startw,
+           (unsigned long)g_sniff.cap_miss_expect);
+
+    st7789_bus_acquire();
+    st7789_fill(LCD_BLACK);
+    st7789_draw_text(14, 2, "STREAM CAPTURE", LCD_WHITE, LCD_BLACK, 2);
+
+    draw_line(34, err ? LCD_RED : LCD_GREEN, "STATE %s",
+              cap_name(err ? CAP_ERROR : CAP_DONE));
+    draw_line(46, LCD_WHITE, "FRAMES %lu", (unsigned long)frames);
+    draw_line(58, LCD_WHITE, "BYTES %lu", (unsigned long)bytes);
+    draw_line(70, LCD_WHITE, "LOST %lu", (unsigned long)g_sniff.cap_lost);
+    draw_line(82, LCD_WHITE, "STALE %lu", (unsigned long)g_sniff.cap_stale);
+    draw_line(94, LCD_WHITE, "GLITCH %lu", (unsigned long)g_sniff.cap_glitch);
+    draw_line(106, LCD_WHITE, "QDROP %lu", (unsigned long)g_sniff.cap_qdrop);
+    draw_line(118, LCD_WHITE, "SLOTDRP %lu", (unsigned long)g_sniff.cap_slotdrop);
+    draw_line(130, LCD_WHITE, "MAXW %lu  ERR %lu",
+              (unsigned long)g_sniff.cap_frame_maxw, (unsigned long)err);
+    draw_line(142, LCD_CYAN, "FILE RPSTREAM.BIN");
+    draw_line(154, LCD_GREY, "RUN capview.py --stream");
+
+    for (;;) {
+        tight_loop_contents();
+    }
+}
+#else /* CAP_MODE_WINDOW */
+/*
+ * 落盘模式下的监视循环。
+ *
+ * 屏幕在整段采集期间是"离线"的：LCD 和 TF 卡共用 GPIO10/11，
+ * Core 1 一用 SD 就得占住这对脚。所以这里只通过串口报告进度，
+ * 等 Core 1 收尾、把总线交回来之后，再把结果一次性画到屏幕上。
+ */
+static void capture_monitor(void)
+{
+    uint32_t last_state = 0xFFFFFFFFu;
+    uint32_t last_idx = 0xFFFFFFFFu;
+    uint32_t last_err = 0xFFFFFFFFu;
+    bool screen_done = false;
+
+    for (;;) {
+        __dmb();
+        uint32_t st = g_sniff.cap_state;
+        uint32_t idx = g_sniff.cap_index;
+        uint32_t total = g_sniff.cap_total;
+        uint32_t err = g_sniff.cap_err;
+        uint32_t bytes = g_sniff.cap_file_bytes;
+        uint32_t last_ms = g_sniff.cap_last_ms;
+        uint32_t samples = g_sniff.cap_sample_hz;
+
+        if (st != last_state || idx != last_idx || err != last_err) {
+            printf("cap state=%s idx=%lu/%lu err=%lu bytes=%lu "
+                   "last=%lums rate=%luHz\n",
+                   cap_name(st),
+                   (unsigned long)idx, (unsigned long)total,
+                   (unsigned long)err, (unsigned long)bytes,
+                   (unsigned long)last_ms, (unsigned long)samples);
+            last_state = st;
+            last_idx = idx;
+            last_err = err;
+        }
+
+        if (!screen_done && (st == CAP_DONE || st == CAP_ERROR)) {
+            screen_done = true;
+
+            /* Core 1 已经 sdcard_deinit()，GPIO10/11 空出来了 */
+            st7789_bus_acquire();
+            st7789_fill(LCD_BLACK);
+            st7789_draw_text(14, 2, "SD CAPTURE", LCD_WHITE, LCD_BLACK, 2);
+
+            draw_line(34, st == CAP_DONE ? LCD_GREEN : LCD_RED,
+                      "STATE %s", cap_name(st));
+            draw_line(46, LCD_WHITE, "RECS %lu/%lu",
+                      (unsigned long)idx, (unsigned long)total);
+            draw_line(58, LCD_WHITE, "ERR %lu", (unsigned long)err);
+            draw_line(70, LCD_WHITE, "BYTES %lu", (unsigned long)bytes);
+            draw_line(82, LCD_WHITE, "RATE %lu MHZ",
+                      (unsigned long)(samples / 1000000u));
+            draw_line(94, LCD_CYAN, "FILE RPCAP.BIN");
+            draw_line(106, LCD_GREY, "RUN capview.py");
+
+            printf("cap finished: file=/RPCAP.BIN bytes=%lu err=%lu\n",
+                   (unsigned long)bytes, (unsigned long)err);
+        }
+
+        sleep_ms(50);
+    }
+}
+#endif /* CAP_MODE_WINDOW */
+#endif /* SNIFF_CAPTURE_TO_SD */
 
 int main(void)
 {
@@ -330,7 +639,13 @@ int main(void)
     extern const char fw_build_stamp[];
     printf("build %s\n", fw_build_stamp);
 
+#if SNIFF_CAPTURE_TO_SD && (CAP_MODE == CAP_MODE_STREAM)
+    st7789_draw_text(14, 2, "STREAM CAP", LCD_WHITE, LCD_BLACK, 2);
+#elif SNIFF_CAPTURE_TO_SD
+    st7789_draw_text(14, 2, "SD CAPTURE", LCD_WHITE, LCD_BLACK, 2);
+#else
     st7789_draw_text(14, 2, "SPI SNIFF", LCD_WHITE, LCD_BLACK, 2);
+#endif
 
     /* 标题下方显示实际配置的频率（读时钟树寄存器，是"设定值"；
      * 屏幕第 22 行的 CLK 才是 Core 1 用 XOSC 实测的真实值）。 */
@@ -340,14 +655,30 @@ int main(void)
     st7789_draw_text(2, 22, clk_ok ? sub : "CLK FAIL",
                      clk_ok ? LCD_GREY : LCD_RED, LCD_BLACK, 1);
 
+#if SNIFF_CAPTURE_TO_SD
+    st7789_draw_text(2, 34, "TF SHARED WITH LCD", LCD_GREY, LCD_BLACK, 1);
+#endif
+
     printf("RP_Bus_Sniffer: sys=%lu MHz clk_ok=%d\n",
            (unsigned long)sys_mhz, clk_ok);
     printf("sniffer pins: CS=%d SCK=%d MOSI=%d MISO=%d\n",
            PIN_SNIFF_CS, PIN_SNIFF_SCK, PIN_SNIFF_MOSI, PIN_SNIFF_MISO);
 
+#if SNIFF_CAPTURE_TO_SD
+    /* 落盘模式：Core 1 要用 GPIO10/11 驱动 TF 卡，而这两根脚现在由
+     * LCD 的 SPI1 占用。启动 Core 1 之前先把它们交出去，之后屏幕
+     * 不再刷新，直到采集结束、Core 1 释放总线。 */
+    st7789_bus_release();
+#endif
+
     /* 启动 Core 1。入口是 sniffer_core1_entry()，它会一直循环不返回。 */
     multicore_launch_core1(sniffer_core1_entry);
 
+#if SNIFF_CAPTURE_TO_SD && (CAP_MODE == CAP_MODE_STREAM)
+    stream_writer();        /* 不返回 */
+#elif SNIFF_CAPTURE_TO_SD
+    capture_monitor();      /* 不返回 */
+#else
     uint32_t last_state = 0xFFFFFFFFu;
     uint32_t last_frame = 0;
     uint32_t last_diag_seq = 0;
@@ -526,4 +857,5 @@ int main(void)
         /* 20ms 一轮 ≈ 50Hz，满足屏幕刷新要求，也不会把 CPU 全占满 */
         sleep_ms(20);
     }
+#endif /* SNIFF_CAPTURE_TO_SD */
 }

@@ -20,6 +20,13 @@
 #define LCD_GREY    0x8410
 
 void st7789_init(void);
+
+/* LCD 与 TF 卡共用 GPIO10/11（SCK/MOSI），两套外设不能同时接管这对脚。
+ * 需要用 SD 卡时先 release，用完再 acquire；acquire 之后屏幕内容还在，
+ * 但需要自己重画（SPI 外设是重新初始化的）。 */
+void st7789_bus_release(void);
+void st7789_bus_acquire(void);
+
 void st7789_fill(uint16_t color);
 void st7789_draw_text(int x, int y, const char *text,
                       uint16_t fg, uint16_t bg, uint8_t scale);

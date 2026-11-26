@@ -36,6 +36,11 @@
 #include "board.h"
 #include "sniffer.h"
 
+#if SNIFF_CAPTURE_TO_SD && (CAP_MODE == CAP_MODE_WINDOW)
+#include "sdcard.h"
+#include "ff.h"
+#endif
+
 /* 编译期检查：四根线必须连续。若在 board.h 里改了引脚却不符合这个要求，
  * 直接编译失败，比烧到板子上再发现"数据全错"要好得多。 */
 #if (PIN_SNIFF_SCK != (PIN_SNIFF_CS + 1)) || \
@@ -119,6 +124,7 @@ static volatile uint32_t s_ring[RING_WORDS] __attribute__((aligned(RING_BYTES)))
 /* DMA 通道号，-1 表示还没申请。decode_last_frame 要靠它读 DMA 写指针 */
 static int s_dma_chan = -1;
 
+#if !SNIFF_CAPTURE_TO_SD
 /* 本帧解出的完整字节流（Core 1 私有）。发布到共享区时才拷贝，
  * 这样被过滤的短帧不会破坏上一帧已发布的数据。 */
 static uint8_t s_dump_mosi[SNIFF_DUMP_BYTES];
@@ -131,6 +137,7 @@ static uint32_t s_dump_bytes;
 static uint32_t s_raw_fail_dumps;
 static uint32_t s_raw_long_dumps;
 static uint32_t s_raw_seq;
+#endif
 
 /* CS 下降沿中断：Core 1 进入解析后，轮询引脚是"瞎"的（解析一帧要几十
  * 微秒，而 14µs 的 64 字节读帧可能在这段时间里开始并结束）。因此改用
@@ -138,24 +145,43 @@ static uint32_t s_raw_seq;
  *
  * 中断只做两件事：置标志、记下发生时间。环形缓冲覆盖 328µs，只要解析
  * 一帧的耗时短于这个窗口，就不会丢帧。 */
+#if !SNIFF_CAPTURE_TO_SD || (CAP_MODE == CAP_MODE_WINDOW)
 static volatile bool     s_cs_event;
 static volatile uint64_t s_cs_fall_us;
+
+/* 触发瞬间的 DMA 写指针（环内字序号）。
+ *
+ * 在中断里读一次写指针，"CS 下降沿发生在采样流的哪个位置"就是精确的，
+ * 不用等主循环醒来再按时间估算。落盘时把它写进记录头，PC 端据此在
+ * 波形上标出触发点。 */
+static volatile uint32_t s_cs_fall_word;
 
 static void cs_fall_isr(uint gpio, uint32_t events)
 {
     (void)gpio;
     (void)events;
+
+    if (s_dma_chan >= 0) {
+        uint32_t waddr = (uint32_t)(uintptr_t)
+            dma_channel_hw_addr(s_dma_chan)->write_addr;
+        uint32_t base = (uint32_t)(uintptr_t)s_ring;
+        s_cs_fall_word = ((waddr - base) >> 2) & (RING_WORDS - 1u);
+    }
     s_cs_fall_us = time_us_64();
     s_cs_event = true;
 }
+#endif /* !SNIFF_CAPTURE_TO_SD || CAP_MODE_WINDOW */
 
 /* 诊断快照写入序号（Core 1 私有） */
+#if !SNIFF_CAPTURE_TO_SD
 static uint32_t s_diag_seq;
 
 /* 最后一次"发布"出去的结果状态。屏幕上的 STATE 显示它，而不是当前这一帧
  * 的瞬时状态：命令帧被过滤后要回到这里，否则界面会停在 CAPTURING。 */
 static uint32_t s_published_state = SNIFF_ARMED;
+#endif
 
+#if !SNIFF_CAPTURE_TO_SD
 /*
  * 取环形缓冲里某个绝对位置（0 .. RING_SAMPLES-1）的 4bit 采样点。
  *
@@ -482,6 +508,7 @@ static void publish_frame(const frame_result_t *r, uint32_t elapsed_us,
     __dmb();
     g_sniff.frame_no = frame;
 }
+#endif /* !SNIFF_CAPTURE_TO_SD */
 
 /*
  * 用 XOSC 时基实测 clk_sys（单位 kHz）。
@@ -525,6 +552,805 @@ static uint32_t measure_clk_sys_khz(PIO pio)
     }
     return (uint32_t)(((uint64_t)n * 1000u) / dt_us);   /* kHz */
 }
+
+#if SNIFF_CAPTURE_TO_SD && (CAP_MODE == CAP_MODE_WINDOW)
+/*
+ * 原始采样落盘（诊断模式）
+ *
+ * 记录格式（小端）：
+ *   offset 0  magic      'RPSN'
+ *   offset 4  version    u16 = 1
+ *   offset 6  hdr_bytes  u16 = 36
+ *   offset 8  seq        记录序号（0 起）
+ *   offset 12 sample_hz  采样率（实测 clk_sys）
+ *   offset 16 words      每条记录的字数（8192，每字 8 个采样点）
+ *   offset 20 trig_word  CS 下降沿触发瞬间的环内字序号
+ *   offset 24 stop_word  停止采样瞬间 DMA 写指针（= 记录数据的起点）
+ *   offset 28 trig_us    触发到停止之间的微秒数（墙钟实测）
+ *   offset 32 flags      bit0 = clk 已实测，bit1 = 卡按块寻址，
+ *                        bit2 = 环未写满一圈，记录开头一段是上一轮的残留
+ *   之后是 words 个 32bit 字，按时间从旧到新排列；每个字里
+ *   bit[4k+0]=CS  bit[4k+1]=SCK  bit[4k+2]=MOSI  bit[4k+3]=MISO，
+ *   k=0 是该字里最早的采样点。
+ *
+ * 为什么把整个环都写进去：环里是停止时刻之前 328µs 的连续采样，
+ * 触发点落在其中某处（约 150µs 之前）。PC 端按 stop_word 把环"展开"，
+ * 再按 trig_word 标出触发位置，触发前后都有波形可看。
+ */
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t hdr_bytes;
+    uint32_t seq;
+    uint32_t sample_hz;
+    uint32_t words;
+    uint32_t trig_word;
+    uint32_t stop_word;
+    uint32_t trig_us;
+    uint32_t flags;
+} cap_hdr_t;
+
+/*
+ * 重新武装采样：停状态机 -> 复位移位器/PC -> 重启 DMA 环形缓冲。
+ * 每条记录写完后都要从这里重新开始，保证环里的数据是"新的"，
+ * 不会混进上一条记录的残留。
+ */
+static void sampling_restart(PIO pio, uint sm, uint offset,
+                             const pio_sm_config *cfg)
+{
+    pio_sm_set_enabled(pio, sm, false);
+    pio_sm_init(pio, sm, offset, cfg);     /* 内部会清 FIFO、复位 PC */
+    pio_sm_set_enabled(pio, sm, true);
+
+    dma_channel_config dc = dma_channel_get_default_config(s_dma_chan);
+    channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);
+    channel_config_set_read_increment(&dc, false);
+    channel_config_set_write_increment(&dc, true);
+    channel_config_set_dreq(&dc, pio_get_dreq(pio, sm, false));
+    channel_config_set_ring(&dc, true, 15);
+    channel_config_set_high_priority(&dc, true);
+    dma_channel_configure(s_dma_chan, &dc, s_ring, &pio->rxf[sm],
+                          dma_encode_endless_transfer_count(), true);
+}
+
+/*
+ * 诊断模式主循环（Core 1，不返回）。
+ *
+ * 每条记录：等 CS 下降沿 -> 再采 CAP_WINDOW_US -> 停采样 -> 写 TF 卡。
+ * 写卡期间采样是停着的，所以环里不会一边写一边被 DMA 覆盖。
+ */
+static void capture_to_sd(PIO pio, uint sm, uint offset,
+                          const pio_sm_config *cfg)
+{
+    static FATFS s_fs;
+    static FIL   s_fil;
+
+    sdcard_info_t info;
+    uint32_t err = 0;
+    uint32_t size = 0;
+
+    g_sniff.cap_total = CAP_RECORDS;
+    g_sniff.cap_sample_hz = g_sniff.clk_meas_khz
+        ? g_sniff.clk_meas_khz * 1000u
+        : clock_get_hz(clk_sys);
+    __dmb();
+    g_sniff.cap_state = CAP_SD_INIT;
+    __dmb();
+
+    if (!sdcard_init(&info)) {
+        err = info.err_stage ? info.err_stage : 1u;
+        goto finish;
+    }
+
+    if (f_mount(&s_fs, "", 1) != FR_OK) {
+        err = 10u;
+        goto finish;
+    }
+    if (f_open(&s_fil, "RPCAP.BIN", FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) {
+        err = 11u;
+        (void)f_mount(NULL, "", 0);
+        goto finish;
+    }
+
+    /* 环形缓冲存满一整圈需要的时间（约 327.68µs）。若触发来得比这还快，
+     * 记录开头就是上一轮没被覆盖的旧采样，写入时用 flags bit2 标出来。 */
+    const uint64_t ring_us =
+        ((uint64_t)RING_SAMPLES * 1000000ull) / g_sniff.cap_sample_hz;
+
+    for (uint32_t n = 0; n < CAP_RECORDS; n++) {
+        sampling_restart(pio, sm, offset, cfg);
+        uint64_t t_restart = time_us_64();
+
+        /* 清掉重新武装之前残留的事件：那个下降沿对应的采样位置
+         * 已经不属于新的一轮，当作触发会把记录头标错。 */
+        uint32_t irq = save_and_disable_interrupts();
+        s_cs_event = false;
+        s_cs_fall_word = 0;
+        restore_interrupts(irq);
+
+        __dmb();
+        g_sniff.cap_state = CAP_ARMED;
+        __dmb();
+
+        uint64_t t_arm = time_us_64();
+        while (!s_cs_event) {
+            if (time_us_64() - t_arm > CAP_TRIG_TIMEOUT_US) {
+                break;
+            }
+            tight_loop_contents();
+        }
+        if (!s_cs_event) {
+            err = 13u;               /* 等不到触发，把已写的记录保留 */
+            break;
+        }
+
+        irq = save_and_disable_interrupts();
+        uint64_t t_fall = s_cs_fall_us;
+        uint32_t trig_word = s_cs_fall_word;
+        restore_interrupts(irq);
+
+        g_sniff.cap_trig_word = trig_word;
+        __dmb();
+        g_sniff.cap_state = CAP_WINDOW;
+        __dmb();
+
+        /* 触发后再采一段时间。环形缓冲能存 328µs，150µs 的窗口
+         * 完全放得下，还剩下约 178µs 的"触发前"数据。 */
+        busy_wait_us(CAP_WINDOW_US);
+
+        /* 停采样：先停状态机，再读写指针，最后终止 DMA。
+         * 顺序反过来会让 DMA 在"读完指针"和"停掉"之间又写几个字，
+         * 记录头和实际数据就对不上了。 */
+        pio_sm_set_enabled(pio, sm, false);
+        uint32_t waddr = (uint32_t)(uintptr_t)
+            dma_channel_hw_addr(s_dma_chan)->write_addr;
+        uint32_t stop_word =
+            ((waddr - (uint32_t)(uintptr_t)s_ring) >> 2) & (RING_WORDS - 1u);
+        dma_channel_abort(s_dma_chan);
+        uint64_t t_stop = time_us_64();
+
+        cap_hdr_t h;
+        h.magic = 0x4E535052u;                    /* "RPSN" 小端 */
+        h.version = 1;
+        h.hdr_bytes = (uint16_t)sizeof(h);
+        h.seq = n;
+        h.sample_hz = g_sniff.cap_sample_hz;
+        h.words = RING_WORDS;
+        h.trig_word = trig_word;
+        h.stop_word = stop_word;
+        h.trig_us = (uint32_t)(t_stop - t_fall);
+        h.flags = (info.block_addressing ? 2u : 0u) |
+                  (g_sniff.clk_meas_khz ? 1u : 0u) |
+                  ((t_stop - t_restart) < ring_us ? 4u : 0u);
+
+        g_sniff.cap_stop_word = stop_word;
+        __dmb();
+        g_sniff.cap_state = CAP_WRITING;
+        __dmb();
+
+        /* 环形缓冲按时间展开：从 stop_word 写到环尾，再从环头写到 stop_word。
+         * 此时采样已停，s_ring 不会再变；volatile 只是为了给 DMA 看，
+         * 这里通过 uintptr_t 转成普通指针交给 FatFs。 */
+        bool ok = true;
+        UINT bw = 0;
+        uint32_t tail = RING_WORDS - stop_word;
+
+        if (f_write(&s_fil, &h, (UINT)sizeof(h), &bw) != FR_OK ||
+            bw != (UINT)sizeof(h)) {
+            ok = false;
+        }
+        if (ok && (f_write(&s_fil, (const void *)(uintptr_t)&s_ring[stop_word],
+                           tail * 4u, &bw) != FR_OK || bw != tail * 4u)) {
+            ok = false;
+        }
+        if (ok && stop_word &&
+            (f_write(&s_fil, (const void *)(uintptr_t)&s_ring[0],
+                     stop_word * 4u, &bw) != FR_OK || bw != stop_word * 4u)) {
+            ok = false;
+        }
+        if (ok && f_sync(&s_fil) != FR_OK) {
+            ok = false;
+        }
+        if (!ok) {
+            err = 12u;
+            break;
+        }
+
+        g_sniff.cap_last_ms = (uint32_t)((time_us_64() - t_fall) / 1000u);
+        size = (uint32_t)f_size(&s_fil);
+        __dmb();
+        g_sniff.cap_index = n + 1u;
+        __dmb();
+    }
+
+    /* 收尾：关闭文件（f_close 会 flush），卸载，释放总线 */
+    if (err == 0) {
+        size = (uint32_t)f_size(&s_fil);
+    }
+    (void)f_close(&s_fil);
+    (void)f_mount(NULL, "", 0);
+
+finish:
+    sdcard_deinit();               /* 把 GPIO10/11 交还，Core 0 才能用 LCD */
+
+    g_sniff.cap_file_bytes = size;
+    g_sniff.cap_err = err;
+    __dmb();
+    g_sniff.cap_state = err ? CAP_ERROR : CAP_DONE;
+    __dmb();
+
+    for (;;) {
+        tight_loop_contents();
+    }
+}
+#endif /* SNIFF_CAPTURE_TO_SD && CAP_MODE_WINDOW */
+
+#if SNIFF_CAPTURE_TO_SD && (CAP_MODE == CAP_MODE_STREAM)
+/*
+ * 按帧连续记录（Core 1）
+ *
+ * 与 CAP_MODE_WINDOW 的根本差别：采样一天 24 小时不停，写卡不在这个核上。
+ *
+ *   中断（两个边沿）        主循环（Core 1）              Core 0
+ *   ─────────────────       ─────────────────────        ────────────────
+ *   记下 CS 位置 ──入队──>  按描述从环里拷出这一帧  ──>  缓冲块满就交过去
+ *                           写进缓冲块                   f_write 到 TF 卡
+ *                                                    写完把缓冲标空闲
+ *
+ * 关键设计：
+ *
+ * 1) 中断里绝不拷贝数据。64 字节读帧有 340 个字，在中断里拷要十几微秒，
+ *    这段时间里 40MHz 的后续帧全部错过。中断只做"记下位置入队"。
+ *    队列深 16：环只保留 328µs，轮询帧 26µs 一个，能排队的有效帧本来
+ *    就只有这么多，再深只会积压出全是垃圾的陈旧描述符。
+ *
+ * 2) 从环形缓冲按"帧"取，不是按"时间窗"取。所以命令帧和它后面紧跟的
+ *    数据帧都是独立完整的记录，PC 端能按 t_us 还原总线上真实的先后顺序。
+ *
+ * 3) 存储量由"总线忙的时间"决定，不是墙钟时间。2 秒周期里总线忙约
+ *    707µs，折合 71KB，平均 35KB/s——TF 卡（12.5MHz SPI ≈ 1.5MB/s）
+ *    完全跟得上，所以能做到零丢帧的连续记录。如果换成"把 200MHz 采样
+ *    不停往里灌"，100MB/s 比卡快 60 多倍，任何缓冲都撑不过几百毫秒。
+ *
+ * 4) 两级缓冲：32KB 环形缓冲（328µs 历史，吸收中断到主循环的延迟）+
+ *    8×16KB 缓冲块（吸收 TF 卡写入的抖动）。环被覆盖、缓冲块全满、队列
+ *    溢出都只丢帧并计数，绝不阻塞采集循环。
+ *
+ * 5) 采集循环绝不能等：一旦等（比如等 Core 0 写完一块），中断仍在每
+ *    26µs 塞一个描述符，而环只有 328µs 历史。等几毫秒后，排队的描述符
+ *    全部指向已被覆盖的位置。判断"描述符是否还有效"必须用时间戳
+ *    （copy_frame 里的 age_us），不能用环内字序号相减——序号是模 8192 的。
+ */
+
+uint8_t    g_cap_buf[CAP_STREAM_SLOTS][CAP_STREAM_BUF_BYTES] __attribute__((aligned(4)));
+cap_slot_t g_cap_slot[CAP_STREAM_SLOTS];
+
+/* 描述符队列深度。环只装得下 328µs 的采样，轮询帧 26µs 一个，
+ * 也就是说最多只有十几帧是"还有效"的。队列比这更深没有意义——
+ * 排在前面的描述符取出来时环早被覆盖了，只会被当成 stale 丢掉。 */
+#define FRAME_Q_LEN   16u
+
+/* 环覆盖的墙钟时间，以及由此导出的"描述符最大可用年龄"。
+ * 采样率用配置值：实测值在采集开始前才写进 g_sniff，中断里不能依赖它。 */
+#define SAMPLES_PER_US   (SNIFF_SYS_CLK_KHZ / 1000u)
+#define RING_SPAN_US     (RING_SAMPLES / SAMPLES_PER_US)
+
+/* 环内字序号随时间的推进速度：每字 8 个采样点，200MHz -> 25 字/µs。
+ * 这个关系是 copy_frame 按时间戳定位帧的依据。 */
+#define WORDS_PER_US     (SAMPLES_PER_US / 8u)
+
+typedef struct {
+    uint32_t start_w;   /* CS 下降沿时 DMA 写指针（环内字序号） */
+    uint32_t t_us;      /* CS 下降沿时刻，相对采集起点 */
+} frame_desc_t;
+
+static volatile frame_desc_t s_fq[FRAME_Q_LEN];
+static volatile uint32_t s_fq_head;        /* 中断写 */
+static volatile uint32_t s_fq_tail;        /* 主循环写 */
+static volatile bool     s_in_frame;
+static volatile uint32_t s_frame_start_w;
+static volatile uint64_t s_frame_start_us;
+static uint64_t s_stream_t0;               /* 采集起点，中断里只读 */
+
+/* 上一个"已确认找到"的 CS 下降沿：环内字序号 + 它的时间戳。
+ * 用来按时间外推下一帧的位置，见 copy_frame 开头。只在主循环里读写。 */
+static uint32_t s_ref_w;
+static uint32_t s_ref_t;
+static bool     s_ref_valid;
+
+/* 帧起点搜索窗口（相对于"按时间外推出来的位置"，单位都是字）。
+ *
+ * 外推位置 = 上一帧下降沿的位置 + 两帧间隔 × 25 字/µs。采样时钟和
+ * 微秒计时器都由同一个晶振分频/倍频而来，两者比例恒定，所以这个映射
+ * 只受"时间戳按 1µs 截断"的影响，误差 ±1µs = ±25 字。先扫窄窗，
+ * 覆盖这个量化误差；落空再扫宽窗，覆盖中断延迟的波动。
+ *
+ * 取"离目标最近"的下降沿而不是"第一个"：命令帧和紧随其后的数据帧
+ * 只差 1µs 左右，窗口一开大就会先撞上前一帧的下降沿。 */
+#define FRAME_NEAR_BACK    32u    /* ±32 字 = ±1.28µs */
+#define FRAME_NEAR_SPAN    64u
+#define FRAME_WIDE_BACK   128u    /* ±128 字 = ±5.12µs */
+#define FRAME_WIDE_SPAN   256u
+
+/* 兜底：没有参考点（第 1 帧），或者外推完全落空时，从中断记下的写指针
+ * 位置向前扫。
+ *
+ * 写指针是滞后的，但滞后量不超过一个帧间隔，所以"它后面的第一个下降沿"
+ * 就是这一帧的下降沿——这里必须取第一个，不能取"最近"（附近根本没有）。
+ *
+ * 窗口要开得足够大。曾经只开 48 字，结果第 1 帧的写指针只要滞后超过
+ * 48 字就扫不到，模型从此建立不起来：之后每一帧都按残帧处理，主循环
+ * 每帧多花 30µs 以上，跟不上 26µs 一帧的节奏，环形缓冲被覆盖，后面
+ * 所有帧跟着失败（实测 stale 从 1038 涨到 10216，落盘帧数从 10872
+ * 掉到 639）。2048 字 = 82µs，覆盖最长的轮询间隔还有几倍余量。
+ *
+ * 这条路径只在模型建立时走，建立之后就是 ±32 字的窄窗，不会拖慢主循环。 */
+#define FRAME_BOOT_BACK    8u
+#define FRAME_BOOT_SCAN    2048u
+
+/* 起点没找到时最多录这么多字（768 字 = 30.7µs，够覆盖一个轮询帧）。
+ *
+ * 这种记录本来就是残帧：起点是滞后的写指针，帧内容要等 PC 端自己
+ * 在 CS 里找。但绝不能让它一路扫到 FRAME_MAX_WORDS——一帧 4096 字
+ * 的扫描要 160µs 以上，主循环一跟不上环形缓冲就被覆盖，失败的帧会
+ * 越来越多，形成死循环。 */
+#define FRAME_MISS_WORDS   768u
+
+/* 单帧上限：4096 字 = 32768 个采样点 = 164µs。
+ * 64 字节的页编程/读帧是 13.6µs（340 字），留 10 倍余量。 */
+#define FRAME_MAX_WORDS    4096u
+
+/* CS 低电平不足 2 个字（80ns）的判为边沿振铃/串扰，直接丢。
+ * 最短的真帧是 1 字节命令（40 bit = 200 个采样点 = 25 个字）。 */
+#define FRAME_GLITCH_WORDS 2u
+
+#define FRAME_F_TRUNC      0x01u
+
+/* 当前正在填的乒乓缓冲 */
+static uint32_t s_cur_slot;
+static uint32_t s_cur_bytes;
+static uint32_t s_cur_frames;
+
+static bool stream_flush(void);
+
+/*
+ * CS 双边沿中断：只记录"这一帧在环里的位置"，不碰数据。
+ *
+ * 为什么要双边沿：只有下降沿的话，主循环还得再等 CS 回高才能知道帧有多长，
+ * 等待期间只能靠墙钟猜；直接拿到上升沿位置，帧的结束点就是采样流里的
+ * 精确下标，不用等也不用猜。
+ */
+static void cs_edge_isr(uint gpio, uint32_t events)
+{
+    (void)gpio;
+
+    uint32_t w = 0;
+    if (s_dma_chan >= 0) {
+        uint32_t waddr = (uint32_t)(uintptr_t)
+            dma_channel_hw_addr(s_dma_chan)->write_addr;
+        uint32_t base = (uint32_t)(uintptr_t)s_ring;
+        w = ((waddr - base) >> 2) & (RING_WORDS - 1u);
+    }
+
+    /* 一次回调里可能同时挂着两个边沿（极短毛刺），先处理下降沿 */
+    if (events & GPIO_IRQ_EDGE_FALL) {
+        s_in_frame = true;
+        s_frame_start_w = w;
+        s_frame_start_us = time_us_64();
+    }
+    if ((events & GPIO_IRQ_EDGE_RISE) && s_in_frame) {
+        s_in_frame = false;
+        uint32_t h = s_fq_head;
+        uint32_t n = (h + 1u) & (FRAME_Q_LEN - 1u);
+        if (n == s_fq_tail) {
+            g_sniff.cap_qdrop = g_sniff.cap_qdrop + 1u;   /* 队列满，这一帧放弃 */
+            return;
+        }
+        s_fq[h].start_w = s_frame_start_w;
+        s_fq[h].t_us    = (uint32_t)(s_frame_start_us - s_stream_t0);
+        __dmb();
+        s_fq_head = n;
+    }
+}
+
+/*
+ * 一个 32bit 字里各采样点的 CS 跳变位置。
+ *
+ * CS 是每个 nibble 的 bit0，掩码 0x11111111：
+ *   c    = 各点的 CS 电平，bit[4k] = cs[k]
+ *   c<<4 = 各点的前一个采样点，bit[4k] = cs[k-1]
+ *          （k=0 的前一点在上一字里，用 prev_cs 补进 bit0）
+ *   返回值 bit[4k] = cs[k] ^ cs[k-1]，即"这一点和上一点电平不同"。
+ *
+ * 再和 c（或 ~c）相与，就分别得到 0->1（上升）和 1->0（下降）的位置。
+ * 用位运算而不是逐点循环：一次扫描最多 4096 个字，逐点要 32768 次，
+ * 在 26µs 一帧的轮询期里会来不及。
+ */
+static inline uint32_t cs_edges(uint32_t w, uint32_t prev_cs)
+{
+    uint32_t c = w & 0x11111111u;
+    return (c ^ ((c << 4) | (prev_cs & 1u))) & 0x11111111u;
+}
+
+/* 在 from_w 起的 nwords 个字里找第一个 CS 下降沿。
+ * 找到时返回 true，*out_w 是所在字，*out_k 是字内采样点下标（0..7）。 */
+static bool find_cs_fall(uint32_t from_w, uint32_t nwords,
+                         uint32_t *out_w, uint32_t *out_k)
+{
+    uint32_t prev = (s_ring[(from_w + RING_WORDS - 1u) & (RING_WORDS - 1u)] >> 28) & 1u;
+    for (uint32_t i = 0; i < nwords; i++) {
+        uint32_t wi = (from_w + i) & (RING_WORDS - 1u);
+        uint32_t w  = s_ring[wi];
+        uint32_t fall = cs_edges(w, prev) & ~(w & 0x11111111u) & 0x11111111u;
+        if (fall) {
+            *out_w = wi;
+            *out_k = (uint32_t)__builtin_ctz(fall) >> 2;
+            return true;
+        }
+        prev = (w >> 28) & 1u;
+    }
+    return false;
+}
+
+/* 在 from_w 起的 nwords 个字里找"离 target_off 最近"的 CS 下降沿。
+ *
+ * target_off 是目标位置相对 from_w 起点的采样点偏移。用"最近"而不是
+ * "第一个"：预测位置两侧可能各有一个下降沿（命令帧和紧随其后的数据帧
+ * 只差 1µs 左右），取第一个会抓到上一帧。 */
+static bool find_cs_fall_near(uint32_t from_w, uint32_t nwords, int32_t target_off,
+                              uint32_t *out_w, uint32_t *out_k)
+{
+    uint32_t prev = (s_ring[(from_w + RING_WORDS - 1u) & (RING_WORDS - 1u)] >> 28) & 1u;
+    int32_t  best = 0x7FFFFFFF;
+    bool     got  = false;
+
+    for (uint32_t i = 0; i < nwords; i++) {
+        uint32_t wi = (from_w + i) & (RING_WORDS - 1u);
+        uint32_t w  = s_ring[wi];
+        uint32_t fall = cs_edges(w, prev) & ~(w & 0x11111111u) & 0x11111111u;
+        while (fall) {
+            uint32_t k   = (uint32_t)__builtin_ctz(fall) >> 2;
+            int32_t  off = (int32_t)(i * 8u + k);
+            int32_t  dist = off - target_off;
+            if (dist < 0) {
+                dist = -dist;
+            }
+            if (dist < best) {
+                best = dist;
+                *out_w = wi;
+                *out_k = k;
+                got = true;
+            }
+            fall &= fall - 1u;      /* 清最低位，继续看同一个字里的其它下降沿 */
+        }
+        prev = (w >> 28) & 1u;
+    }
+    return got;
+}
+
+/* 从 (from_w, from_k) 这个下降沿之后找第一个 CS 上升沿。 */
+static bool find_cs_rise(uint32_t from_w, uint32_t from_k, uint32_t nwords,
+                         uint32_t *out_w, uint32_t *out_k)
+{
+    uint32_t prev = 0;          /* 下降沿之后的前一点一定是低 */
+    for (uint32_t i = 0; i < nwords; i++) {
+        uint32_t wi = (from_w + i) & (RING_WORDS - 1u);
+        uint32_t w  = s_ring[wi];
+        uint32_t c  = w & 0x11111111u;
+        uint32_t rise = cs_edges(w, prev) & c;
+        if (i == 0) {
+            /* 同一个字里，下降沿所在采样点及之前的位置不算 */
+            rise &= (from_k >= 7u) ? 0u : (0x11111111u << (4u * (from_k + 1u)));
+        }
+        if (rise) {
+            *out_w = wi;
+            *out_k = (uint32_t)__builtin_ctz(rise) >> 2;
+            return true;
+        }
+        prev = (w >> 28) & 1u;
+    }
+    return false;
+}
+
+/*
+ * 把当前这块交给 Core 0，换到任意一块空闲的。
+ *
+ * 这里绝对不能等。等 Core 0 写完的这段时间里，40MHz 采样不会停，中断
+ * 照旧每 26µs 往队列里塞一个描述符；环只有 328µs 历史，等几毫秒之后
+ * 排队的描述符全部指向已经被覆盖的位置，取出来的就是几毫秒之后的
+ * 新数据（不是那一帧）。所以：有空块就交出去，没有就整块倒掉并计数，
+ * 采集循环永远不阻塞。
+ *
+ * 返回 false 表示这次是整块倒掉的。
+ */
+static bool stream_flush(void)
+{
+    if (s_cur_bytes == 0u) {
+        return true;
+    }
+
+    uint32_t nxt = CAP_STREAM_SLOTS;
+    for (uint32_t i = 1u; i <= CAP_STREAM_SLOTS; i++) {
+        uint32_t s = (s_cur_slot + i) % CAP_STREAM_SLOTS;
+        if (s == s_cur_slot) {
+            continue;
+        }
+        if (g_cap_slot[s].state == CAP_SLOT_FREE) {
+            nxt = s;
+            break;
+        }
+    }
+
+    if (nxt >= CAP_STREAM_SLOTS) {
+        /* 一块空闲的都没有：Core 0 写卡跟不上。丢掉这半块，继续用当前块。 */
+        g_sniff.cap_slotdrop = g_sniff.cap_slotdrop + 1u;
+        g_sniff.cap_lost     = g_sniff.cap_lost + s_cur_frames;
+        s_cur_bytes  = 0;
+        s_cur_frames = 0;
+        return false;
+    }
+
+    g_cap_slot[s_cur_slot].bytes  = s_cur_bytes;
+    g_cap_slot[s_cur_slot].frames = s_cur_frames;
+    __dmb();
+    g_cap_slot[s_cur_slot].state = CAP_SLOT_READY;
+    __dmb();
+
+    /* 通知 Core 0。数据本身在共享 SRAM 里，FIFO 只传"哪一块好了"。
+     * 超时 0 = 不阻塞：FIFO 满了说明 Core 0 还在忙，它自己也会轮询所有块，
+     * 少一条通知不影响正确性，但绝不能让采集循环卡在这里。 */
+    (void)multicore_fifo_push_timeout_us(0xB0F0u | s_cur_slot, 0);
+
+    s_cur_slot   = nxt;
+    s_cur_bytes  = 0;
+    s_cur_frames = 0;
+    g_cap_slot[nxt].state = CAP_SLOT_FILLING;
+    return true;
+}
+
+/*
+ * 把一帧从环形缓冲拷进当前缓冲块。
+ *
+ * 帧本身有问题（太老、太短、超出单帧上限）都只是计数后跳过，永不阻塞。
+ */
+static void copy_frame(const frame_desc_t *d)
+{
+    /*
+     * 陈旧检查：环只保留最近 RING_SPAN_US（约 328µs）的采样。描述符如果
+     * 比这还老，它指向的那一段已经被 DMA 绕回来重新写过了，读到的是
+     * "现在"的总线数据，不是这一帧的。
+     *
+     * 这里必须用时间戳判断，不能用环内字序号相减：序号是模 8192 的，
+     * 到底绕了几圈从序号上看不出来——曾经就是因为这个，落后 6ms（绕过
+     * 二十圈）的描述符被当成"只落后几百字"照单全收，写进文件的全是
+     * 几毫秒之后的新数据，4096 字的纯空闲帧就是这么来的。
+     */
+    uint32_t now_us = (uint32_t)(time_us_64() - s_stream_t0);
+    uint32_t age_us = now_us - d->t_us;
+    if (age_us >= RING_SPAN_US) {
+        g_sniff.cap_stale = g_sniff.cap_stale + 1u;
+        return;
+    }
+
+    /*
+     * 帧起点不能靠中断里读到的 DMA 写指针来定位。
+     *
+     * 中断里读 write_addr 时，在 DMA 满速写入（25M 字/s）的状态下它读回来
+     * 是滞后的，而且滞后量随帧长在几微秒到几十微秒之间变化：实测把一帧
+     * 的起点记到了 11~25µs 之前，于是在那个位置往前后 40 个字里根本找不到
+     * CS 下降沿，整帧只能从滞后点开始录到下一个上升沿——文件里 633 帧有
+     * 630 帧被标成截断，且每条记录前面都挂着半帧到一整帧的空闲，就是这么来的。
+     *
+     * 改用的办法：采样时钟就是系统时钟，环内位置随时间是严格线性的
+     * （WORDS_PER_US 字/µs），所以只要知道上一帧下降沿的位置和时间，
+     * 就能算出这一帧的下降沿应该在哪——时间戳是准的，不受写指针滞后的影响。
+     * 找到后立刻把参考点挪到这一帧，误差不会累积。
+     */
+    if (age_us > g_sniff.cap_age_max) {
+        g_sniff.cap_age_max = age_us;
+    }
+
+    uint32_t sw, sk;
+    uint32_t flags = 0;
+    uint32_t from = 0xFFFFFFFFu;   /* 0xFFFFFFFF = 这一轮没进入外推分支 */
+    uint32_t expect = 0;
+    bool found = false;
+
+    if (s_ref_valid) {
+        uint32_t dlt = (d->t_us - s_ref_t) * WORDS_PER_US;
+        expect = (s_ref_w + dlt) & (RING_WORDS - 1u);
+
+        from  = (expect + RING_WORDS - FRAME_NEAR_BACK) & (RING_WORDS - 1u);
+        found = find_cs_fall_near(from, FRAME_NEAR_SPAN,
+                                  (int32_t)FRAME_NEAR_BACK, &sw, &sk);
+        if (found) {
+            g_sniff.cap_fall_near = g_sniff.cap_fall_near + 1u;
+        } else {
+            from  = (expect + RING_WORDS - FRAME_WIDE_BACK) & (RING_WORDS - 1u);
+            found = find_cs_fall_near(from, FRAME_WIDE_SPAN,
+                                      (int32_t)FRAME_WIDE_BACK, &sw, &sk);
+            if (found) {
+                g_sniff.cap_fall_wide = g_sniff.cap_fall_wide + 1u;
+            }
+        }
+    }
+    if (!found) {
+        /* 第 1 帧，或者外推落空（帧被丢过、DMA 丢过字）：退回写指针窄窗口 */
+        from  = (d->start_w + RING_WORDS - FRAME_BOOT_BACK) & (RING_WORDS - 1u);
+        found = find_cs_fall(from, FRAME_BOOT_BACK + FRAME_BOOT_SCAN, &sw, &sk);
+        if (found) {
+            g_sniff.cap_fall_boot = g_sniff.cap_fall_boot + 1u;
+        } else {
+            g_sniff.cap_fall_miss = g_sniff.cap_fall_miss + 1u;
+            g_sniff.cap_miss_t      = d->t_us;
+            g_sniff.cap_miss_startw = d->start_w;
+            g_sniff.cap_miss_expect = s_ref_valid ? expect : 0xFFFFFFFFu;
+        }
+    }
+
+    if (found && s_ref_valid) {
+        /* 外推点与实际下降沿的距离（环内环形距离，单位字） */
+        uint32_t a = (sw - expect) & (RING_WORDS - 1u);
+        uint32_t b = (expect - sw) & (RING_WORDS - 1u);
+        uint32_t e = (a < b) ? a : b;
+        if (e > g_sniff.cap_pred_err) {
+            g_sniff.cap_pred_err = e;
+        }
+    }
+
+    if (found) {
+        /* 找到的位置相对搜索窗口起点的偏差，正常应在几十个字以内。
+         * 持续偏大说明外推模型有问题（丢字或时钟偏差），看这个数。 */
+        uint32_t back = (sw - from) & (RING_WORDS - 1u);
+        if (back > g_sniff.cap_backw) {
+            g_sniff.cap_backw = back;
+        }
+        s_ref_w = sw;
+        s_ref_t = d->t_us;
+        s_ref_valid = true;
+    } else {
+        sw = d->start_w;
+        sk = 0;
+        flags |= FRAME_F_TRUNC;
+    }
+
+    /* 起点没找到时只扫 FRAME_MISS_WORDS，别让残帧拖垮主循环（见定义处） */
+    uint32_t scan = found ? FRAME_MAX_WORDS : FRAME_MISS_WORDS;
+    uint32_t ew, ek;
+    if (!find_cs_rise(sw, sk, scan, &ew, &ek)) {
+        ew = (sw + scan - 1u) & (RING_WORDS - 1u);
+        flags |= FRAME_F_TRUNC;
+    }
+
+    uint32_t nwords = ((ew - sw) & (RING_WORDS - 1u)) + 1u;
+    if (nwords < FRAME_GLITCH_WORDS) {
+        g_sniff.cap_glitch = g_sniff.cap_glitch + 1u;
+        return;
+    }
+    if (nwords > g_sniff.cap_frame_maxw) {
+        g_sniff.cap_frame_maxw = nwords;
+    }
+
+    /* 这一帧本身占用的时间也要落在环的有效历史之内：帧尾那一个字
+     * 同样会被 DMA 覆盖。 */
+    uint32_t span_us = (nwords * 8u) / SAMPLES_PER_US;
+    if (age_us + span_us > RING_SPAN_US) {
+        g_sniff.cap_stale = g_sniff.cap_stale + 1u;
+        return;
+    }
+
+    uint32_t need = CAP_STREAM_RECHDR + nwords * 4u;
+    if (need > CAP_STREAM_BUF_BYTES) {
+        g_sniff.cap_lost = g_sniff.cap_lost + 1u;
+        return;
+    }
+    if (s_cur_bytes + need > CAP_STREAM_BUF_BYTES) {
+        /* 没空块时会整块倒掉并计数；当前帧仍然写进（已倒空的）当前块。 */
+        (void)stream_flush();
+    }
+
+    uint8_t *out = &g_cap_buf[s_cur_slot][s_cur_bytes];
+
+    /* 帧记录头：t_us / words / flags / pad，小端手写，避免结构体对齐差异 */
+    out[0] = (uint8_t)d->t_us;
+    out[1] = (uint8_t)(d->t_us >> 8);
+    out[2] = (uint8_t)(d->t_us >> 16);
+    out[3] = (uint8_t)(d->t_us >> 24);
+    out[4] = (uint8_t)nwords;
+    out[5] = (uint8_t)(nwords >> 8);
+    out[6] = (uint8_t)flags;
+    out[7] = 0;
+    out += CAP_STREAM_RECHDR;
+
+    /* 按环内顺序逐字拷贝。每字 4 字节直接按字搬，不做位/字节重排——
+     * 原始采样原样留给 PC 端解析。
+     *
+     * 目标始终 4 字节对齐（s_cur_bytes 只按 8 + 4*字数 增长，g_cap_buf
+     * 也是 4 对齐），所以可以直接做 uint32 存储。这里不用 memcpy：
+     * 逐字调用一次 4 字节 memcpy 在 -O2 下也未必内联，648 字一帧就是
+     * 上千个额外周期，而轮询帧 26µs 一个，浪费不起。 */
+    uint32_t *dst = (uint32_t *)(uintptr_t)out;
+    uint32_t wi = sw;
+    for (uint32_t i = 0; i < nwords; i++) {
+        *dst++ = s_ring[wi];
+        wi = (wi + 1u) & (RING_WORDS - 1u);
+    }
+
+    s_cur_bytes += need;
+    s_cur_frames++;
+}
+
+/*
+ * 连续记录主循环（Core 1，不返回）。
+ *
+ * 采样和 DMA 在进这里之前就已经自由运行了（见 sniffer_core1_entry），
+ * 这里只负责"从队列取帧描述 -> 拷进乒乓缓冲 -> 满了交给 Core 0"。
+ */
+static void capture_stream(void)
+{
+    g_sniff.cap_mode = CAP_MODE_STREAM;
+    g_sniff.cap_sample_hz = g_sniff.clk_meas_khz
+        ? g_sniff.clk_meas_khz * 1000u
+        : clock_get_hz(clk_sys);
+
+    s_stream_t0  = time_us_64();
+    s_fq_head    = 0;
+    s_fq_tail    = 0;
+    s_in_frame   = false;
+    s_ref_valid  = false;      /* 参考点清零：第 1 帧走写指针窄窗口 */
+    s_cur_slot   = 0;
+    s_cur_bytes  = 0;
+    s_cur_frames = 0;
+    for (uint32_t i = 0; i < CAP_STREAM_SLOTS; i++) {
+        g_cap_slot[i].bytes  = 0;
+        g_cap_slot[i].frames = 0;
+        g_cap_slot[i].state  = (i == 0u) ? CAP_SLOT_FILLING : CAP_SLOT_FREE;
+    }
+    __dmb();
+
+    g_sniff.cap_state = CAP_WINDOW;      /* 复用：表示"正在采" */
+    __dmb();
+
+    /* 双边沿：下降沿记帧头，上升沿记帧尾 */
+    gpio_set_irq_enabled_with_callback(PIN_SNIFF_CS,
+                                       GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE,
+                                       true, &cs_edge_isr);
+
+    uint64_t t_end = s_stream_t0 + (uint64_t)CAP_STREAM_MS * 1000ull;
+
+    while (time_us_64() < t_end) {
+        if (s_fq_tail == s_fq_head) {
+            tight_loop_contents();
+            continue;
+        }
+
+        /* 先把描述整份读到本地再放行队列项：中断随时会写下一项，
+         * 但 head != tail 保证了中断不会碰我们正在读的这一个。 */
+        frame_desc_t d;
+        d.start_w = s_fq[s_fq_tail].start_w;
+        d.t_us    = s_fq[s_fq_tail].t_us;
+        __dmb();
+        s_fq_tail = (s_fq_tail + 1u) & (FRAME_Q_LEN - 1u);
+
+        copy_frame(&d);
+    }
+
+    /* 收尾：把最后半块交出去。此刻中断里可能还有一帧没结束（CS 仍低），
+     * 它没有帧尾，直接放掉——记录到 CS 拉低为止是实打实的。
+     * 没空块时这一块就倒掉，不算错误：Core 0 是否卡死由它自己的超时兜底。 */
+    (void)stream_flush();
+
+    __dmb();
+    g_sniff.cap_stream_done = 1u;
+    __dmb();
+
+    (void)multicore_fifo_push_timeout_us(0xB0FFu, 0);  /* 叫醒 Core 0 收尾 */
+
+    for (;;) {
+        tight_loop_contents();
+    }
+}
+#endif /* SNIFF_CAPTURE_TO_SD && CAP_MODE_STREAM */
 
 /*
  * Core 1 入口。由 Core 0 调用 multicore_launch_core1() 启动，永不返回。
@@ -654,6 +1480,22 @@ void sniffer_core1_entry(void)
     /* ---- 8) 启动采样，进入主循环 ---- */
     pio_sm_set_enabled(pio, sm, true);
 
+#if SNIFF_CAPTURE_TO_SD && (CAP_MODE == CAP_MODE_STREAM)
+    /* 连续记录：采样已经自由运行，直接进"取帧 -> 乒乓缓冲"的循环。
+     * 写卡在 Core 0 上做（见 RP_Bus_Sniffer.c 的 stream_writer）。 */
+    g_sniff.state = SNIFF_ARMED;
+    __dmb();
+    capture_stream();
+    /* capture_stream 不返回 */
+#elif SNIFF_CAPTURE_TO_SD
+    /* 一次性窗口：只注册 CS 下降沿中断（触发用），不跑解码循环 */
+    gpio_set_irq_enabled_with_callback(PIN_SNIFF_CS, GPIO_IRQ_EDGE_FALL,
+                                       true, &cs_fall_isr);
+    g_sniff.state = SNIFF_ARMED;
+    __dmb();
+    capture_to_sd(pio, sm, offset, &cfg);
+    /* capture_to_sd 不返回 */
+#else
     uint32_t frame = 0;
     g_sniff.state = SNIFF_ARMED;
     __dmb();
@@ -884,4 +1726,5 @@ void sniffer_core1_entry(void)
             g_sniff.state = s_published_state;
         }
     }
+#endif /* SNIFF_CAPTURE_TO_SD */
 }

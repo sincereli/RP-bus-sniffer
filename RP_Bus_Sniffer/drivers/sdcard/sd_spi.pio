@@ -1,0 +1,23 @@
+;
+; SD 卡 SPI 模式主机（PIO1）
+;
+; 板载 TF 卡槽按 SDIO 接线（CLK/CMD/D0/D3），SPI 模式下的对应关系是：
+;   CLK  -> SCK        CMD -> MOSI
+;   D0   -> MISO       D3  -> CS（由 SIO 软件控制）
+; 所以这里是一个标准的 SPI Mode 0 主机：SCK 空闲为低，数据在下降沿改变、
+; 在上升沿被采样。
+;
+; 指令时序（clkdiv 为 1 时每 bit 4 个 clk_sys 周期）：
+;   out pins,1  side 0 [1]   ; SCK 低：把下一位放到 MOSI
+;   in  pins,1  side 1 [1]   ; SCK 高：采样 MISO
+;
+; 位序说明：OUT 从 OSR 低位取数，IN 把新位放进 ISR 高位，两边都是"低位先出"，
+; 而 SD 要求 MSB 先出，所以 C 侧在收发时各做一次 8bit 位反转（见 sdcard.c）。
+
+.program sd_spi
+.side_set 1 opt
+
+.wrap_target
+    out pins, 1   side 0 [1]
+    in  pins, 1   side 1 [1]
+.wrap

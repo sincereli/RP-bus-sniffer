@@ -142,6 +142,29 @@ static void lcd_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
     /* CS 保持低，由调用者发送像素数据后拉高 */
 }
 
+void st7789_bus_release(void)
+{
+    cs_high();
+    spi_deinit(LCD_SPI);
+
+    /* 交回普通 GPIO 并置为高阻输入，让 PIO 完全接管这两根线 */
+    gpio_set_function(PIN_LCD_SCK, GPIO_FUNC_SIO);
+    gpio_set_function(PIN_LCD_MOSI, GPIO_FUNC_SIO);
+    gpio_set_dir(PIN_LCD_SCK, GPIO_IN);
+    gpio_set_dir(PIN_LCD_MOSI, GPIO_IN);
+    gpio_disable_pulls(PIN_LCD_SCK);
+    gpio_disable_pulls(PIN_LCD_MOSI);
+}
+
+void st7789_bus_acquire(void)
+{
+    gpio_set_function(PIN_LCD_SCK, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_LCD_MOSI, GPIO_FUNC_SPI);
+    spi_init(LCD_SPI, LCD_SPI_HZ);
+    spi_set_format(LCD_SPI, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    cs_high();
+}
+
 void st7789_init(void)
 {
     gpio_init(PIN_LCD_CS);

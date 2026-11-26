@@ -41,6 +41,23 @@ typedef enum {
  * 1024 字 = 8192 个采样点 = 41µs，足够覆盖一帧 14µs 外加等待时间。 */
 #define SNIFF_RAW_WORDS 1024u
 
+/* ---- 原始采样落盘（诊断模式，见 board.h 的 SNIFF_CAPTURE_TO_SD）----
+ * 这条通路不做任何解码：触发一次就把整个环形缓冲原样写进 TF 卡，
+ * 由 PC 端 tools/capview.py 画波形。状态机：
+ *   SD_INIT -> ARMED -> WINDOW -> WRITING -> ARMED ... -> DONE
+ *                  ^                          |
+ *                  +--------------------------+
+ */
+typedef enum {
+    CAP_OFF = 0,        /* 未启用 */
+    CAP_SD_INIT,        /* 正在初始化卡/挂载/建文件 */
+    CAP_ARMED,          /* 采样运行，等 CS 下降沿 */
+    CAP_WINDOW,         /* 已触发，正在采触发后的固定窗口 */
+    CAP_WRITING,        /* 采样已停，正在把环形缓冲写完 */
+    CAP_DONE,           /* 全部记录写完，文件已关闭 */
+    CAP_ERROR,          /* cap_err 里是失败阶段 */
+} cap_state_t;
+
 /* 单个 CS 帧的处理结果快照（诊断用）。
  * Core 1 每处理一帧填一份，Core 0 只读快照，避免逐字段读到不同帧的值。
  * 双缓冲：Core 1 交替写两份，写完整份后 diag_seq 才加一。 */
@@ -65,6 +82,52 @@ typedef struct {
     uint32_t max_low;   /* 候选中"下降沿之后 32 点里 CS 低"的最大个数 */
     uint32_t max_high;  /* 候选中"下降沿之前 32 点里 CS 高"的最大个数 */
 } sniff_diag_t;
+
+/* ---- 按帧连续记录（CAP_MODE_STREAM）----
+ *
+ * 记录格式（RPSTREAM.BIN，小端）：
+ *
+ *   文件头 24 字节
+ *     offset 0  magic       'RPSF' = 0x46535052
+ *     offset 4  version     u16 = 1
+ *     offset 6  hdr_bytes   u16 = 24
+ *     offset 8  sample_hz   采样率（实测 clk_sys）
+ *     offset 12 clk_khz     实测 clk_sys（kHz），和上面同源，冗余一份便于核对
+ *     offset 16 reserved    0
+ *     offset 20 reserved    0
+ *
+ *   之后是若干"帧记录"，每条 8 字节头 + 原始采样字：
+ *     offset 0  t_us    帧开始时刻，相对采集起点的微秒数
+ *     offset 4  words   后面跟的 32bit 字数
+ *     offset 6  flags   bit0 = 截断（没在环里找到 CS 上升沿，按上限截断）
+ *     offset 7  pad     0
+ *     offset 8  words*4 字节原始采样字
+ *
+ * 字的位布局与 RPCAP.BIN 完全一致：bit[4k+0]=CS  +1=SCK  +2=MOSI  +3=MISO，
+ * k=0 是该字里最早的采样点。所以 PC 端两条通路可以共用同一套解包代码。
+ */
+#define CAP_STREAM_MAGIC   0x46535052u   /* 'RPSF' 小端 */
+#define CAP_STREAM_HDR     24u
+#define CAP_STREAM_RECHDR  8u
+
+typedef enum {
+    CAP_SLOT_FREE = 0,      /* 可以写 */
+    CAP_SLOT_FILLING,       /* Core 1 正在往里写 */
+    CAP_SLOT_READY,         /* Core 1 写满/收尾，等 Core 0 落盘 */
+} cap_slot_state_t;
+
+typedef struct {
+    volatile uint32_t state;    /* cap_slot_state_t */
+    volatile uint32_t bytes;    /* 有效字节数 */
+    volatile uint32_t frames;   /* 这块里有多少个 CS 帧 */
+} cap_slot_t;
+
+#if SNIFF_CAPTURE_TO_SD && (CAP_MODE == CAP_MODE_STREAM)
+/* 乒乓缓冲。定义在 sniffer.c；Core 1 只写正在填充的那一块，
+ * Core 0 只读已经置成 READY 的那一块，两者不会同时碰同一块。 */
+extern uint8_t    g_cap_buf[CAP_STREAM_SLOTS][CAP_STREAM_BUF_BYTES];
+extern cap_slot_t g_cap_slot[CAP_STREAM_SLOTS];
+#endif
 
 typedef struct {
     /* ---- 状态标志 ---- */
@@ -151,6 +214,43 @@ typedef struct {
      * 也不会被改到。 */
     volatile uint32_t diag_seq;
     volatile sniff_diag_t diag[2];
+
+    /* ---- 原始采样落盘状态 ---- */
+    volatile uint32_t cap_state;      /* cap_state_t */
+    volatile uint32_t cap_index;      /* 已写完的记录条数 */
+    volatile uint32_t cap_total;      /* 计划写入的条数 */
+    volatile uint32_t cap_err;        /* 失败阶段：1~4 = SD 初始化，10 = 挂载，
+                                       * 11 = 建文件，12 = 写文件，13 = 等触发超时 */
+    volatile uint32_t cap_file_bytes; /* 文件总字节数（收尾时填写） */
+    volatile uint32_t cap_last_ms;    /* 最近一条记录从触发到 f_sync 的毫秒数 */
+    volatile uint32_t cap_trig_word;  /* 触发时刻 DMA 写指针在环里的字序号 */
+    volatile uint32_t cap_stop_word;  /* 停止采样时刻的写指针（记录起点） */
+    volatile uint32_t cap_sample_hz;  /* 采样率 = 实测 clk_sys */
+
+    /* ---- 按帧连续记录的统计（CAP_MODE_STREAM）---- */
+    volatile uint32_t cap_mode;        /* CAP_MODE_WINDOW / CAP_MODE_STREAM */
+    volatile uint32_t cap_frames;      /* 已写进文件的 CS 帧数 */
+    volatile uint32_t cap_frame_maxw;  /* 单帧最大字数（诊断：正常读帧约 340） */
+    volatile uint32_t cap_glitch;      /* 丢掉的高频毛刺（CS 低 < 2 个字） */
+    volatile uint32_t cap_lost;        /* 因缓冲满/环被覆盖而丢掉的帧 */
+    volatile uint32_t cap_stale;       /* 描述符太老、环已被覆盖而丢掉的帧 */
+    volatile uint32_t cap_slotdrop;    /* 没有空闲缓冲块，整块倒掉的次数 */
+    volatile uint32_t cap_qdrop;       /* 中断队列溢出丢掉的帧 */
+    volatile uint32_t cap_backw;       /* 帧起点回溯距离的最大值（字） */
+    volatile uint32_t cap_stream_done; /* 1 = Core 1 已收尾，Core 0 写完剩余缓冲即可退出 */
+
+    /* ---- 帧起点定位的分支统计（诊断外推模型是否可靠）---- */
+    volatile uint32_t cap_fall_near;   /* 外推点 ±32 字内找到下降沿 */
+    volatile uint32_t cap_fall_wide;   /* 外推点 ±128 字内找到 */
+    volatile uint32_t cap_fall_boot;   /* 外推落空，退回中断写指针窗口找到 */
+    volatile uint32_t cap_fall_miss;   /* 全部落空，这一帧按截断处理 */
+    volatile uint32_t cap_pred_err;    /* 外推点与找到的下降沿的最大偏差（字） */
+    volatile uint32_t cap_age_max;     /* 描述符被消费时的最大年龄（µs） */
+
+    /* 最近一次"外推落空"的现场，用来定位模型为什么偏 */
+    volatile uint32_t cap_miss_t;      /* 描述符时间戳（µs） */
+    volatile uint32_t cap_miss_startw; /* 中断里记下的写指针位置（环内字序号） */
+    volatile uint32_t cap_miss_expect; /* 按时间外推出的位置（环内字序号） */
 
     /* ---- 频率信息 ---- */
     volatile uint32_t sck_hz;        /* 由本帧 bit 数和持续时间估算的 SCK 频率 */

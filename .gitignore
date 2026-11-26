@@ -1,1 +1,7 @@
 test_sandbox/
+
+# 固件目录的构建产物由 RP_Bus_Sniffer/.gitignore 负责（build），
+# 这里不要再写 RP_Bus_Sniffer——那会把整个固件源码一起忽略掉。
+.claude/
+__pycache__/
+
